@@ -8,6 +8,11 @@ const RECV_RATE = 24000;   // 24kHz (AI_RATE_RECV)
 const FRAME_SAMPLES = 1600; // 100ms @ 16kHz — khớp với test9_asr.py, ít message hơn qua proxy
 const HANDSHAKE_TIMEOUT_MS = 20000;
 
+// iOS Safari không hỗ trợ <audio>.srcObject từ Web Audio MediaStream đúng cách
+// → "rararara" loop. Trên iOS dùng ctx.destination trực tiếp — hardware AEC đủ tốt.
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+               (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 // AudioWorklet processor — chạy trong audio thread.
 // AudioContext đã được set về 16kHz nên không cần resample trong worklet.
 // AGC được thêm để normalize volume về mức ASR mong đợi (~-9dBFS),
@@ -123,10 +128,15 @@ export function useVoiceCall() {
       recvAudioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: RECV_RATE,
       });
-      mediaStreamDestRef.current = recvAudioContextRef.current.createMediaStreamDestination();
-      audioElRef.current = new Audio();
-      audioElRef.current.srcObject = mediaStreamDestRef.current.stream;
-      audioElRef.current.play().catch(() => {});
+      if (!IS_IOS) {
+        // Non-iOS: route qua <audio> element để AEC có reference signal
+        mediaStreamDestRef.current = recvAudioContextRef.current.createMediaStreamDestination();
+        audioElRef.current = new Audio();
+        audioElRef.current.srcObject = mediaStreamDestRef.current.stream;
+        audioElRef.current.play().catch(() => {});
+      }
+      // iOS: dùng ctx.destination trực tiếp — hardware AEC đủ tốt,
+      // và <audio>.srcObject từ Web Audio MediaStream gây lỗi trên iOS Safari
 
       // Khi context resume sau khi bị suspend (màn hình tắt, app background):
       // reset nextPlayTimeRef để tránh nhiều chunk schedule đồng thời → "rararara"
@@ -366,7 +376,7 @@ export function useVoiceCall() {
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    source.connect(mediaStreamDestRef.current);
+    source.connect(mediaStreamDestRef.current ?? ctx.destination);
 
     const startTime = Math.max(ctx.currentTime + 0.005, nextPlayTimeRef.current);
     source.start(startTime);
