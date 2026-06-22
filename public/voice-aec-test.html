@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Voice AEC Test — Audio Element Playback</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0f0f0f; color: #e0e0e0; padding: 16px; }
+    h1 { font-size: 14px; color: #888; margin-bottom: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+    input[type=text] { flex: 1; min-width: 200px; background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 6px 8px; font-family: monospace; font-size: 12px; }
+    button { background: #2a2a2a; border: 1px solid #444; color: #e0e0e0; padding: 6px 14px; cursor: pointer; font-family: monospace; font-size: 12px; }
+    button:hover { background: #333; }
+    button.active { background: #1a3a1a; border-color: #4a8; color: #4a8; }
+    button.danger { background: #3a1a1a; border-color: #a44; color: #a44; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; }
+    .badge.off { background: #333; color: #666; }
+    .badge.on  { background: #1a3a1a; color: #4a8; }
+    .badge.playing { background: #3a2a1a; color: #a84; }
+    .badge.speaking { background: #1a2a3a; color: #48a; }
+    #log { background: #0a0a0a; border: 1px solid #222; padding: 8px; height: 420px; overflow-y: auto; font-size: 11px; line-height: 1.7; }
+    .log-info    { color: #888; }
+    .log-asr     { color: #4af; }
+    .log-tts     { color: #a84; }
+    .log-barge   { color: #fa4; font-weight: bold; }
+    .log-final   { color: #4a8; font-weight: bold; }
+    .log-warn    { color: #f84; }
+    .log-rms     { color: #556; }
+    .meter { display: flex; gap: 6px; align-items: center; font-size: 11px; color: #666; }
+    .bar-wrap { width: 120px; height: 8px; background: #1a1a1a; border: 1px solid #333; }
+    .bar { height: 100%; background: #4a8; transition: width 0.05s; }
+    .diff { display: inline; padding: 1px 6px; border-radius: 2px; font-size: 10px; }
+    .diff.slow { background: #3a1a1a; color: #f66; }
+    .diff.fast { background: #1a3a1a; color: #6f6; }
+    .note { font-size: 11px; color: #555; margin-top: 4px; }
+  </style>
+</head>
+<body>
+<h1>Voice AEC Test — TTS phát qua &lt;audio&gt; element (không software gate, AEC tự cancel)</h1>
+
+<div class="row">
+  <input type="text" id="wsUrl" value="wss://api-agent.svisor.vn/ws/voice-call/c50b9a6d-0aa7-470f-86ae-d2577a4e7026?api_key=vk_e4d0ceefc936ed26f24ce1d02fcc6ce50c80580b0755c86ba36d445a5ca1e1d3" />
+</div>
+<div class="row">
+  <button id="btnConnect">Connect</button>
+  <button id="btnDisconnect" class="danger" style="display:none">Disconnect</button>
+  <span id="badgeConn" class="badge off">disconnected</span>
+  <span id="badgePlaying" class="badge off">idle</span>
+  <span id="badgeSpeaking" class="badge off">silent</span>
+</div>
+<div class="row meter">
+  <span>rawRms:</span>
+  <div class="bar-wrap"><div class="bar" id="rmsBar" style="width:0%"></div></div>
+  <span id="rmsVal">0.000</span>
+  <span style="margin-left:12px; color:#556">threshold=0.04</span>
+  <div class="bar-wrap" style="width:2px; background:#fa4; flex-shrink:0"></div>
+</div>
+<p class="note">⚠️ Không dùng software echo gate — AEC của browser tự cancel. Quan sát xem transcript có nhanh không khi bot đang nói.</p>
+
+<div id="log"></div>
+
+<script>
+const SEND_RATE     = 16000;
+const RECV_RATE     = 24000;
+const FRAME_SAMPLES = 1600; // 100ms @ 16kHz
+
+// ── AudioWorklet — AGC, gửi { buf, rawRms } ──────────────────────────────────
+const WORKLET_CODE = `
+class PCMSenderProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf       = new Float32Array(0);
+    this._frameSize = ${FRAME_SAMPLES};
+    this._gain      = 1.0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch || !ch.length) return true;
+    const merged = new Float32Array(this._buf.length + ch.length);
+    merged.set(this._buf); merged.set(ch, this._buf.length);
+    this._buf = merged;
+    while (this._buf.length >= this._frameSize) {
+      const frame = this._buf.slice(0, this._frameSize);
+      this._buf   = this._buf.slice(this._frameSize);
+      let sum = 0;
+      for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+      const rms = Math.sqrt(sum / frame.length);
+      const TARGET_RMS = 0.35, MAX_GAIN = 20.0, NOISE_FLOOR = 0.005;
+      if (rms > NOISE_FLOOR) {
+        const desired = Math.min(TARGET_RMS / rms, MAX_GAIN);
+        if (desired < this._gain) this._gain = this._gain * 0.7 + desired * 0.3;
+        else                      this._gain = this._gain * 0.95 + desired * 0.05;
+      }
+      const int16 = new Int16Array(this._frameSize);
+      for (let i = 0; i < this._frameSize; i++) {
+        let s = frame[i];
+        if (rms > NOISE_FLOOR) s = Math.max(-1, Math.min(1, s * this._gain));
+        int16[i] = s < 0 ? s * 32768 : s * 32767;
+      }
+      this.port.postMessage({ buf: int16.buffer, rawRms: rms }, [int16.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-sender-aec', PCMSenderProcessor);
+`;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let ws          = null;
+let sendCtx     = null;
+let recvCtx     = null;
+let mediaStreamDest = null; // AudioContext output → MediaStream
+let audioEl     = null;     // <audio> element — plays MediaStream, AEC có reference
+let workletNode = null;
+let micStream   = null;
+let nextPlayTime = 0;
+let isPlaying   = false;
+let scheduledSrcs = [];
+let audioGen    = 0;
+
+let tStart      = null;  // thời điểm speech_start từ ASR
+let stats       = { partial: 0, final: 0, ttsChunks: 0 };
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+const logEl    = document.getElementById('log');
+const rmsBar   = document.getElementById('rmsBar');
+const rmsVal   = document.getElementById('rmsVal');
+const badgeConn     = document.getElementById('badgeConn');
+const badgePlaying  = document.getElementById('badgePlaying');
+const badgeSpeaking = document.getElementById('badgeSpeaking');
+
+function log(msg, cls = 'log-info') {
+  const ts = tStart ? `+${((Date.now() - tStart)/1000).toFixed(2)}s` : new Date().toLocaleTimeString('vi');
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = `[${ts}] ${msg}`;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setConn(on) {
+  badgeConn.className = 'badge ' + (on ? 'on' : 'off');
+  badgeConn.textContent = on ? 'connected' : 'disconnected';
+  document.getElementById('btnConnect').style.display    = on ? 'none' : '';
+  document.getElementById('btnDisconnect').style.display = on ? '' : 'none';
+}
+
+function setPlaying(on) {
+  isPlaying = on;
+  badgePlaying.className = 'badge ' + (on ? 'playing' : 'off');
+  badgePlaying.textContent = on ? 'TTS playing' : 'idle';
+}
+
+function setSpeaking(on) {
+  badgeSpeaking.className = 'badge ' + (on ? 'speaking' : 'off');
+  badgeSpeaking.textContent = on ? 'speaking' : 'silent';
+}
+
+// ── Audio playback — via MediaStreamDestination → <audio> element ─────────────
+// Khác với main app (AudioBufferSourceNode → ctx.destination):
+//   Ở đây: AudioBufferSourceNode → MediaStreamDestination → MediaStream → <audio>.srcObject
+//   <audio> element đi qua system audio path → AEC của browser có reference signal → tự cancel echo
+function initRecvAudio() {
+  recvCtx = new AudioContext({ sampleRate: RECV_RATE });
+  mediaStreamDest = recvCtx.createMediaStreamDestination();
+
+  // <audio> element nhận MediaStream — đây là "system audio" mà AEC track được
+  audioEl = new Audio();
+  audioEl.srcObject = mediaStreamDest.stream;
+  audioEl.play().catch(() => {});
+
+  log('RecvAudio init: AudioContext → MediaStreamDestination → <audio> element', 'log-info');
+}
+
+function stopAllAudio(reason) {
+  audioGen++;
+  scheduledSrcs.forEach(s => { try { s.stop(); } catch {} });
+  scheduledSrcs = [];
+  nextPlayTime = 0;
+  setPlaying(false);
+  if (reason) log(`⏹ stopAudio: ${reason}`, 'log-barge');
+}
+
+function scheduleAudio(arrayBuffer) {
+  if (!recvCtx) initRecvAudio();
+  if (recvCtx.state === 'suspended') recvCtx.resume();
+
+  const int16   = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+  const buf = recvCtx.createBuffer(1, float32.length, RECV_RATE);
+  buf.getChannelData(0).set(float32);
+
+  const src = recvCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(mediaStreamDest); // → MediaStreamDestination (không phải ctx.destination)
+
+  const startTime = Math.max(recvCtx.currentTime + 0.01, nextPlayTime);
+  src.start(startTime);
+  nextPlayTime = startTime + buf.duration;
+
+  scheduledSrcs.push(src);
+  setPlaying(true);
+  stats.ttsChunks++;
+
+  const myGen = audioGen;
+  src.onended = () => {
+    if (audioGen !== myGen) return;
+    scheduledSrcs = scheduledSrcs.filter(s => s !== src);
+    if (scheduledSrcs.length === 0) setPlaying(false);
+  };
+}
+
+// ── Mic + WebSocket ───────────────────────────────────────────────────────────
+async function startMic() {
+  sendCtx = new AudioContext({ sampleRate: SEND_RATE, latencyHint: 'interactive' });
+  if (sendCtx.state === 'suspended') await sendCtx.resume();
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,  // browser AEC — cần <audio> element để có reference
+      noiseSuppression: true,
+      autoGainControl: false,   // tắt AGC hardware, dùng software AGC trong worklet
+    }
+  });
+
+  const blob      = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+  const blobUrl   = URL.createObjectURL(blob);
+  await sendCtx.audioWorklet.addModule(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+
+  const micSrc  = sendCtx.createMediaStreamSource(micStream);
+  workletNode   = new AudioWorkletNode(sendCtx, 'pcm-sender-aec');
+
+  const silentGain = sendCtx.createGain();
+  silentGain.gain.value = 0;
+  workletNode.connect(silentGain);
+  silentGain.connect(sendCtx.destination);
+  micSrc.connect(workletNode);
+
+  let speakingTimer = null;
+  let frameCount = 0;
+
+  workletNode.port.onmessage = (e) => {
+    const { buf, rawRms } = e.data;
+
+    // Update RMS meter
+    rmsBar.style.width = Math.min(rawRms / 0.1 * 100, 100) + '%';
+    rmsBar.style.background = rawRms >= 0.04 ? '#fa4' : '#4a8';
+    rmsVal.textContent = rawRms.toFixed(3);
+
+    frameCount++;
+    if (frameCount % 50 === 0) {
+      log(`[MIC] frame=${frameCount} rawRms=${rawRms.toFixed(4)} isPlaying=${isPlaying}`, 'log-rms');
+    }
+
+    if (rawRms > 0.01) {
+      setSpeaking(true);
+      clearTimeout(speakingTimer);
+      speakingTimer = setTimeout(() => setSpeaking(false), 400);
+    }
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // KHÔNG có software gate — gửi tất cả, để AEC của browser tự cancel echo
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    ws.send(JSON.stringify({ audio_event: { audio_base_64: btoa(binary) } }));
+  };
+
+  log('Mic started — NO software gate, relying on browser AEC via <audio> element', 'log-info');
+}
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+function connect() {
+  const url = document.getElementById('wsUrl').value.trim();
+  log(`Connecting → ${url}`, 'log-info');
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => log('[WS] open — waiting handshake...', 'log-info');
+
+  ws.onclose = () => {
+    log('[WS] closed', 'log-warn');
+    setConn(false);
+    cleanup();
+  };
+
+  ws.onerror = () => {
+    log('[WS] error', 'log-warn');
+    setConn(false);
+  };
+
+  let handshakeDone = false;
+
+  ws.onmessage = async (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      scheduleAudio(event.data);
+      return;
+    }
+
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+
+    if (!handshakeDone) {
+      if (data.type === 'ready') {
+        handshakeDone = true;
+        setConn(true);
+        log('[WS] Handshake OK — starting mic', 'log-info');
+        await startMic();
+      } else {
+        log(`[WS] Handshake failed: got "${data.type}"`, 'log-warn');
+        ws.close();
+      }
+      return;
+    }
+
+    if (data.type === 'interrupt') {
+      stopAllAudio('server interrupt (barge-in)');
+
+    } else if (data.type === 'transcript') {
+      stopAllAudio('transcript received');
+      log(`📝 TRANSCRIPT: "${data.text}"`, 'log-final');
+
+    } else if (data.type === 'token') {
+      // streaming token — chỉ log nếu muốn verbose
+      // log(`token: ${data.token}`, 'log-asr');
+
+    } else if (data.type === 'agent_start') {
+      tStart = Date.now();
+      log('🤖 agent_start', 'log-asr');
+
+    } else if (data.type === 'agent_done') {
+      log('✅ agent_done', 'log-asr');
+
+    } else if (data.type === 'error') {
+      log(`❌ error: ${data.message}`, 'log-warn');
+    }
+  };
+}
+
+function cleanup() {
+  if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (sendCtx)     { sendCtx.close(); sendCtx = null; }
+  if (audioEl)     { audioEl.srcObject = null; audioEl = null; }
+  if (recvCtx)     { recvCtx.close(); recvCtx = null; }
+  mediaStreamDest = null;
+  scheduledSrcs = [];
+  nextPlayTime = 0;
+  isPlaying = false;
+  setPlaying(false);
+  setSpeaking(false);
+}
+
+function disconnect() {
+  if (ws) { ws.close(); ws = null; }
+  cleanup();
+  setConn(false);
+  log('Disconnected', 'log-warn');
+}
+
+document.getElementById('btnConnect').onclick    = connect;
+document.getElementById('btnDisconnect').onclick = disconnect;
+</script>
+</body>
+</html>
