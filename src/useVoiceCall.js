@@ -110,6 +110,10 @@ export function useVoiceCall() {
     discardAudioRef.current = true;
     scheduledSourcesRef.current.forEach((src) => {
       try { src.stop(); } catch { /* already ended */ }
+      // disconnect() ngay sau stop() — iOS Safari có bug: stop() không tắt ngay,
+      // source vẫn phát âm đầu tiên ("ra") trước khi thực sự dừng.
+      // disconnect() loại khỏi audio graph ngay lập tức, tránh "ra ra ra ra".
+      try { src.disconnect(); } catch { /* already disconnected */ }
     });
     scheduledSourcesRef.current = [];
     nextPlayTimeRef.current = 0;
@@ -361,9 +365,12 @@ export function useVoiceCall() {
     const ctx = recvAudioContextRef.current;
     if (ctx.state === "suspended") {
       ctx.resume().catch(() => {});
-      // Khi context đang suspended, currentTime dừng lại. Các chunk mới không nên
-      // nối theo nextPlayTimeRef cũ → reset để chúng play ngay khi context resume.
-      nextPlayTimeRef.current = 0;
+      // Chỉ reset khi nextPlayTimeRef đã qua (stale trong quá khứ của AudioContext).
+      // Không reset vô điều kiện: nếu nhiều chunk đến cùng lúc khi suspended,
+      // mỗi chunk sẽ reset → tất cả schedule tại currentTime+0.005 → overlap → "ra ra ra".
+      if (nextPlayTimeRef.current > 0 && nextPlayTimeRef.current < ctx.currentTime) {
+        nextPlayTimeRef.current = 0;
+      }
     }
 
     const int16Array = new Int16Array(arrayBuffer);
