@@ -99,7 +99,7 @@ export function useVoiceCall() {
   const discardAudioRef = useRef(false);
   const mediaStreamDestRef = useRef(null); // MediaStreamDestination — TTS → <audio> element để AEC có reference
   const audioElRef = useRef(null);          // <audio> element nhận MediaStream
-  const masterGainRef = useRef(null);       // GainNode dùng để instant mute khi barge-in (tránh buzz trên iOS)
+  const masterGainRef = useRef(null);       // Master gain — set 0 on barge-in để iOS không phát stale chunks
   const micStreamRef = useRef(null);
   const workletNodeRef = useRef(null);        // AudioWorklet node
   const handshakeDoneRef = useRef(false);
@@ -109,17 +109,17 @@ export function useVoiceCall() {
   const stopAudio = (reason = "") => {
     audioGenRef.current++;
     discardAudioRef.current = true;
-    // Instant mute qua GainNode — iOS Safari bug: stop() không tắt ngay, source vẫn
-    // kịp phát đoạn đầu ("ra") → nhiều source chồng nhau → "ra ra ra ra".
-    // disconnect() thì tắt ngay nhưng gây buzz "rè rè" (iOS kẹt frame cuối trong hardware pipeline).
-    // Giải pháp: gain=0 → silence hoàn toàn mà không đụng hardware pipeline.
+    // Mute master gain trước — iOS Safari có thể không honor source.stop() cho
+    // các BufferSource đã schedule trong tương lai, khiến chúng vẫn phát ra âm
+    // thanh tại currentTime → "bạ bạ bạ bạ" loop. Gain=0 chặn mọi output.
     if (masterGainRef.current && recvAudioContextRef.current) {
-      const now = recvAudioContextRef.current.currentTime;
-      masterGainRef.current.gain.cancelScheduledValues(now);
-      masterGainRef.current.gain.setValueAtTime(0, now);
+      const ctx = recvAudioContextRef.current;
+      masterGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
+      masterGainRef.current.gain.setValueAtTime(0, ctx.currentTime);
     }
     scheduledSourcesRef.current.forEach((src) => {
       try { src.stop(); } catch { /* already ended */ }
+      try { src.disconnect(); } catch { /* already disconnected */ }
     });
     scheduledSourcesRef.current = [];
     nextPlayTimeRef.current = 0;
@@ -138,17 +138,16 @@ export function useVoiceCall() {
       recvAudioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: RECV_RATE,
       });
-      // MasterGain: điểm kiểm soát volume dùng để instant mute khi barge-in
-      // (gain=0 tắt âm mà không đụng hardware pipeline → không buzz trên iOS)
+      // Master gain node — điểm trung gian duy nhất cho tất cả TTS audio.
+      // Khi barge-in: set gain=0 ngay lập tức để mute, dù iOS không stop được source.
       masterGainRef.current = recvAudioContextRef.current.createGain();
-
       if (!IS_IOS) {
         // Non-iOS: route qua <audio> element để AEC có reference signal
         mediaStreamDestRef.current = recvAudioContextRef.current.createMediaStreamDestination();
-        masterGainRef.current.connect(mediaStreamDestRef.current);
         audioElRef.current = new Audio();
         audioElRef.current.srcObject = mediaStreamDestRef.current.stream;
         audioElRef.current.play().catch(() => {});
+        masterGainRef.current.connect(mediaStreamDestRef.current);
       } else {
         // iOS: dùng ctx.destination trực tiếp — hardware AEC đủ tốt,
         // và <audio>.srcObject từ Web Audio MediaStream gây lỗi trên iOS Safari
@@ -379,19 +378,9 @@ export function useVoiceCall() {
     const ctx = recvAudioContextRef.current;
     if (ctx.state === "suspended") {
       ctx.resume().catch(() => {});
-      // Chỉ reset khi nextPlayTimeRef stale (đã ở trong quá khứ của AudioContext).
-      // Reset vô điều kiện gây overlap: nhiều chunk đến cùng lúc khi suspended đều
-      // schedule tại currentTime+0.005 → chồng nhau → "ra ra ra".
-      if (nextPlayTimeRef.current > 0 && nextPlayTimeRef.current < ctx.currentTime) {
-        nextPlayTimeRef.current = 0;
-      }
-    }
-
-    // Restore gain về 1 nếu đang bị mute từ barge-in
-    if (masterGainRef.current) {
-      const now = ctx.currentTime;
-      masterGainRef.current.gain.cancelScheduledValues(now);
-      masterGainRef.current.gain.setValueAtTime(1, now);
+      // Khi context đang suspended, currentTime dừng lại. Các chunk mới không nên
+      // nối theo nextPlayTimeRef cũ → reset để chúng play ngay khi context resume.
+      nextPlayTimeRef.current = 0;
     }
 
     const int16Array = new Int16Array(arrayBuffer);
@@ -404,7 +393,9 @@ export function useVoiceCall() {
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    source.connect(masterGainRef.current ?? mediaStreamDestRef.current ?? ctx.destination);
+    // Restore master gain — re-arm sau barge-in (nếu gain đang bị set 0)
+    masterGainRef.current.gain.setValueAtTime(1, ctx.currentTime);
+    source.connect(masterGainRef.current);
 
     const startTime = Math.max(ctx.currentTime + 0.005, nextPlayTimeRef.current);
     source.start(startTime);
