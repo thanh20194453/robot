@@ -24,7 +24,6 @@ class PCMSenderProcessor extends AudioWorkletProcessor {
     super();
     this._buf = new Float32Array(0);
     this._frameSize = ${FRAME_SAMPLES};
-    this._gain = 1.0; // AGC gain state
   }
 
   process(inputs) {
@@ -40,34 +39,9 @@ class PCMSenderProcessor extends AudioWorkletProcessor {
       const frame = this._buf.slice(0, this._frameSize);
       this._buf = this._buf.slice(this._frameSize);
 
-      // Tính RMS
-      let sum = 0;
-      for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
-      const rms = Math.sqrt(sum / frame.length);
-
-      // AGC: normalize speech về ~-9dBFS (tương đương outbound.py AGC target_dbfs=-9.0).
-      // Chỉ áp dụng khi rms > 0.005 (noise floor) — không amplify silence
-      // để ASR VAD phân biệt được speech vs silence → is_final trigger nhanh.
-      const TARGET_RMS = 0.35;  // -9dBFS ≈ 0.354
-      const MAX_GAIN   = 20.0;  // tối đa +26dB, tránh amplify noise quá mức
-      const NOISE_FLOOR = 0.005;
-
-      if (rms > NOISE_FLOOR) {
-        const desired = Math.min(TARGET_RMS / rms, MAX_GAIN);
-        // Smooth: attack nhanh (0.3), release chậm (0.05) — giống AGC outbound
-        if (desired < this._gain) {
-          this._gain = this._gain * 0.7 + desired * 0.3;  // attack
-        } else {
-          this._gain = this._gain * 0.95 + desired * 0.05; // release
-        }
-      }
-
       const int16 = new Int16Array(this._frameSize);
       for (let i = 0; i < this._frameSize; i++) {
-        let s = frame[i];
-        if (rms > NOISE_FLOOR) {
-          s = Math.max(-1, Math.min(1, s * this._gain));
-        }
+        const s = frame[i];
         int16[i] = s < 0 ? s * 32768 : s * 32767;
       }
       this.port.postMessage(int16.buffer, [int16.buffer]);
