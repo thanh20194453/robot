@@ -74,6 +74,7 @@ export function useVoiceCall() {
   const mediaStreamDestRef = useRef(null); // MediaStreamDestination — TTS → <audio> element để AEC có reference
   const audioElRef = useRef(null);          // <audio> element nhận MediaStream
   const masterGainRef = useRef(null);       // Master gain — set 0 on barge-in để iOS không phát stale chunks
+  const gainMutedRef = useRef(false);       // true khi gain đang = 0 (sau barge-in), để scheduleAudio chỉ restore khi cần
   const micStreamRef = useRef(null);
   const workletNodeRef = useRef(null);        // AudioWorklet node
   const handshakeDoneRef = useRef(false);
@@ -88,8 +89,10 @@ export function useVoiceCall() {
     // thanh tại currentTime → "bạ bạ bạ bạ" loop. Gain=0 chặn mọi output.
     if (masterGainRef.current && recvAudioContextRef.current) {
       const ctx = recvAudioContextRef.current;
-      masterGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
+      // cancelScheduledValues(0) xóa TOÀN BỘ timeline (past + future), ngăn tích lũy vô hạn
+      masterGainRef.current.gain.cancelScheduledValues(0);
       masterGainRef.current.gain.setValueAtTime(0, ctx.currentTime);
+      gainMutedRef.current = true;
     }
     scheduledSourcesRef.current.forEach((src) => {
       try { src.stop(); } catch { /* already ended */ }
@@ -195,6 +198,7 @@ export function useVoiceCall() {
     activeSourcesRef.current = 0;
     audioGenRef.current = 0;
     discardAudioRef.current = false;
+    gainMutedRef.current = false;
     setIsSpeaking(false);
     clearTimeout(isSpeakingTimeoutRef.current);
   };
@@ -367,8 +371,13 @@ export function useVoiceCall() {
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
-    // Restore master gain — re-arm sau barge-in (nếu gain đang bị set 0)
-    masterGainRef.current.gain.setValueAtTime(1, ctx.currentTime);
+    // Chỉ restore gain khi đang bị mute (sau barge-in) — không gọi mỗi chunk
+    // để tránh tích lũy hàng nghìn automation events làm chậm audio thread.
+    if (gainMutedRef.current) {
+      masterGainRef.current.gain.cancelScheduledValues(0);
+      masterGainRef.current.gain.setValueAtTime(1, ctx.currentTime);
+      gainMutedRef.current = false;
+    }
     source.connect(masterGainRef.current);
 
     const startTime = Math.max(ctx.currentTime + 0.005, nextPlayTimeRef.current);
