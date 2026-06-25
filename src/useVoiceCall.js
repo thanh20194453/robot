@@ -280,7 +280,7 @@ export function useVoiceCall() {
         audio: {
           noiseSuppression: true,
           echoCancellation: true,
-          autoGainControl: true,
+          autoGainControl: false,
           // Không ép sampleRate — để hardware capture native rate
         },
       });
